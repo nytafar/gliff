@@ -221,6 +221,8 @@ impl Session {
 }
 
 fn main() -> glib::ExitCode {
+    #[cfg(target_os = "macos")]
+    homebrew_data_dirs();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -1578,6 +1580,24 @@ fn track_key(ui: &App, code: u32, pressed: bool) -> bool {
     }
 }
 
+/// GLib looks for GSettings schemas and icon themes under `XDG_DATA_DIRS`.
+/// macOS does not set it (though terminals such as Ghostty do), and neither
+/// GLib's default of `/usr/local/share:/usr/share` nor a terminal's list has
+/// Homebrew's prefix on Apple silicon; without it GTK logs a critical for
+/// every settings lookup. Run before GTK or any thread starts.
+#[cfg(target_os = "macos")]
+fn homebrew_data_dirs() {
+    const HOMEBREW: &str = "/opt/homebrew/share";
+    let current = std::env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    if current.split(':').any(|d| d == HOMEBREW) || !std::path::Path::new(HOMEBREW).is_dir() {
+        return;
+    }
+    std::env::set_var("XDG_DATA_DIRS", format!("{HOMEBREW}:{current}"));
+}
+
 /// Send a local key event to the remote, unless `track_key` drops it.
 fn forward_key(ui: &App, code: u32, pressed: bool) {
     // Either Caps Lock event from macOS stands for a whole tap.
@@ -1843,10 +1863,13 @@ fn install_fullscreen_bars(
             if fullscreen_btn.is_active() != full {
                 fullscreen_btn.set_active(full);
             }
-            if full {
+            // macOS GTK can notify the same state twice; move the header
+            // only from where it actually is.
+            let in_content = header.parent().as_ref() == Some(content.upcast_ref());
+            if full && in_content {
                 content.remove(&header);
                 top.set_child(Some(&header));
-            } else {
+            } else if !full && !in_content {
                 top.set_reveal_child(false);
                 top.set_child(None::<&gtk::Widget>);
                 content.prepend(&header);

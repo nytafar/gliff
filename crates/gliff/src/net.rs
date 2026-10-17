@@ -314,8 +314,12 @@ where
     };
     let _ = tokio::time::timeout(FIRST_KEYMAP_WAIT, keymap.wait_for(|k| !k.is_empty())).await;
     let first_keymap = keymap.borrow_and_update().clone();
-    if first_keymap.is_empty() {
+    // A closed watch means no keymap will ever come (macOS), which is not
+    // worth a warning on every connect.
+    if first_keymap.is_empty() && keymap.has_changed().is_ok() {
         tracing::warn!("no local keymap yet; server will default to us");
+    } else if first_keymap.is_empty() {
+        tracing::debug!("no local keymap on this platform; server will default to us");
     }
     tracing::debug!(bytes = first_keymap.len(), "sending keymap");
     writer
