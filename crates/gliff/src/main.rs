@@ -3,18 +3,25 @@
 //!
 //! Decode runs on a worker thread (see `net`); this file is the UI. Decoded
 //! frames arrive as dmabufs, which GTK imports as textures, so the UI has no
-//! GPU code of its own; its one `unsafe` block hands GTK a dmabuf fd.
+//! GPU code of its own; its one `unsafe` block hands GTK a dmabuf fd. On
+//! macOS frames arrive as pixels from the CPU tier, and key codes are
+//! translated by `mac_keys`.
 
 mod clipboard;
 mod clipboard_ui;
 mod keymap;
+#[cfg(any(target_os = "macos", test))]
+mod mac_keys;
 mod net;
+#[cfg(not(target_os = "linux"))]
+mod no_gpu;
 mod paintable;
 mod recent;
 mod theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -25,13 +32,12 @@ use adw::prelude::*;
 use clap::Parser;
 use gliff_proto::{Axis, ClientMsg};
 use gliff_transport::SshTarget;
-use gliff_vk::DisplayFrame;
 use gtk::gdk;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 use net::Frame;
-use net::{Endpoint, Picture, Status, Worker};
+use net::{DisplayFrame, Endpoint, Picture, Status, Worker};
 use recent::Config;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
@@ -68,6 +74,10 @@ struct Cli {
     /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
     #[arg(long)]
     output: Option<String>,
+    /// Open the window fullscreen. With `--headless` the private screen
+    /// then takes this display's resolution and scale from the start.
+    #[arg(long)]
+    fullscreen: bool,
     /// Hotkey that releases captured shortcuts and hands the keyboard back to
     /// the local compositor. Forms: a chord like `shift+escape`, `ctrl+alt+q`
     /// or `super+escape`; `double-<key>` for a double-tap (e.g.
@@ -278,12 +288,12 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .default_height(760)
         .build();
 
-    let header = adw::HeaderBar::builder()
-        .show_title(false)
-        // No window buttons: closing is the compositor's job, and a stray
-        // click on an X in the middle of a remote session is a bad surprise.
-        .decoration_layout("")
-        .build();
+    let header = adw::HeaderBar::builder().show_title(false).build();
+    // No window buttons: closing is the compositor's job, and a stray click
+    // on an X in the middle of a remote session is a bad surprise. macOS
+    // windows keep theirs, as nothing else there closes or hides a window.
+    #[cfg(not(target_os = "macos"))]
+    header.set_decoration_layout(Some(""));
     let entry = gtk::Entry::builder()
         .placeholder_text("user@host")
         .width_chars(32)
@@ -475,6 +485,9 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         });
     }
 
+    if cli.fullscreen {
+        window.fullscreen();
+    }
     window.present();
     // Reconnect the machines that were connected when the window last
     // closed, then any named on the command line, which is shown first.
@@ -1107,6 +1120,7 @@ fn frame_texture(f: Frame) -> Result<gdk::Texture, glib::Error> {
 /// Wrap a decoded frame's dmabuf as a GDK texture. The frame (and its fd)
 /// lives until GTK releases the texture, which returns the image to the
 /// decoder's ring.
+#[cfg(target_os = "linux")]
 fn dmabuf_texture(f: DisplayFrame) -> Result<gdk::Texture, glib::Error> {
     let display = gdk::Display::default()
         .ok_or_else(|| glib::Error::new(glib::FileError::Failed, "no display"))?;
@@ -1128,6 +1142,12 @@ fn dmabuf_texture(f: DisplayFrame) -> Result<gdk::Texture, glib::Error> {
             .set_fd(0, f.fd.as_raw_fd())
             .build_with_release_func(move || drop(f))
     }
+}
+
+/// Without the GPU tier there are no dmabuf frames.
+#[cfg(not(target_os = "linux"))]
+fn dmabuf_texture(f: DisplayFrame) -> Result<gdk::Texture, glib::Error> {
+    match f {}
 }
 
 fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u64) {
@@ -1558,6 +1578,48 @@ fn track_key(ui: &App, code: u32, pressed: bool) -> bool {
     }
 }
 
+/// Send a local key event to the remote, unless `track_key` drops it.
+fn forward_key(ui: &App, code: u32, pressed: bool) {
+    // Either Caps Lock event from macOS stands for a whole tap.
+    #[cfg(target_os = "macos")]
+    if code == mac_keys::CAPS_LOCK {
+        for pressed in [true, false] {
+            send(
+                ui,
+                ClientMsg::Key {
+                    keycode: code,
+                    pressed,
+                },
+            );
+        }
+        return;
+    }
+    if track_key(ui, code, pressed) {
+        send(
+            ui,
+            ClientMsg::Key {
+                keycode: code,
+                pressed,
+            },
+        );
+    }
+}
+
+/// The evdev code of a key event's hardware keycode, or `None` for a key the
+/// remote has no code for. Under Wayland and X11 the keycode is the evdev
+/// code plus 8.
+#[cfg(not(target_os = "macos"))]
+fn evdev_key(keycode: u32) -> Option<u32> {
+    Some(keycode.saturating_sub(8))
+}
+
+/// The evdev code of a key event's hardware keycode, or `None` for a key the
+/// remote has no code for. On macOS the keycode is the native key code.
+#[cfg(target_os = "macos")]
+fn evdev_key(keycode: u32) -> Option<u32> {
+    mac_keys::evdev(keycode)
+}
+
 fn install_input_handlers(
     ui: &Rc<App>,
     video: &gtk::Widget,
@@ -1567,9 +1629,9 @@ fn install_input_handlers(
     video.set_focusable(true);
     video.set_can_focus(true);
 
-    // Keyboard: hardware keycode minus 8 is the evdev code. The controller
-    // runs in the capture phase so that while the picture has the keyboard
-    // every key goes to the remote, ahead of any local handling.
+    // Keyboard: keys go to the remote as evdev codes (see `evdev_key`). The
+    // controller runs in the capture phase so that while the picture has the
+    // keyboard every key goes to the remote, ahead of any local handling.
     let key = gtk::EventControllerKey::new();
     key.set_propagation_phase(gtk::PropagationPhase::Capture);
     let last_tap: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
@@ -1584,34 +1646,22 @@ fn install_input_handlers(
                 release_capture(&ui, &window);
                 return glib::Propagation::Stop;
             }
-            let code = keycode.saturating_sub(8);
+            let Some(code) = evdev_key(keycode) else {
+                return glib::Propagation::Stop;
+            };
             tracing::debug!(code, "key pressed");
-            if track_key(&ui, code, true) {
-                send(
-                    &ui,
-                    ClientMsg::Key {
-                        keycode: code,
-                        pressed: true,
-                    },
-                );
-            }
+            forward_key(&ui, code, true);
             glib::Propagation::Stop
         });
     }
     {
         let ui = ui.clone();
         key.connect_key_released(move |_, _keyval, keycode, _state| {
-            let code = keycode.saturating_sub(8);
+            let Some(code) = evdev_key(keycode) else {
+                return;
+            };
             tracing::debug!(code, "key released");
-            if track_key(&ui, code, false) {
-                send(
-                    &ui,
-                    ClientMsg::Key {
-                        keycode: code,
-                        pressed: false,
-                    },
-                );
-            }
+            forward_key(&ui, code, false);
         });
     }
     video.add_controller(key);
@@ -1923,8 +1973,10 @@ fn request_resize(ui: &App) {
     let Some(s) = active(ui) else {
         return;
     };
-    let size = ui.view_size.get();
-    let scale = device_scale(ui);
+    let (mut size, mut scale) = (ui.view_size.get(), device_scale(ui));
+    if s.headless.get() {
+        (size, scale) = headless_request(size, scale, net::MAX_STREAM);
+    }
     if size.0 < 64
         || size.1 < 64
         || (s.resize_scale.get() == scale
@@ -1942,6 +1994,31 @@ fn request_resize(ui: &App) {
             scale: scale as f32,
         },
     );
+}
+
+/// The headless output to ask for, for a window of `size` device pixels at
+/// `scale`: the window itself when it fits `max`, the largest stream the
+/// client takes. A larger window, such as fullscreen on a 5K display, keeps
+/// its logical size at the highest lower scale that fits, so the remote
+/// desktop keeps the window's layout and gives up only pixel density; the
+/// picture is stretched to fill the window. The scale is a fraction p/q with
+/// q up to 8, as `clean_mode` expects, and never below 1: a window too large
+/// even at scale 1 is asked for as it is, and the server clamps it.
+fn headless_request(size: (u32, u32), scale: f64, max: (u32, u32)) -> ((u32, u32), f64) {
+    if (size.0 <= max.0 && size.1 <= max.1) || scale <= 1.0 || !scale.is_finite() {
+        return (size, scale);
+    }
+    let logical = (size.0 as f64 / scale, size.1 as f64 / scale);
+    let fit = (max.0 as f64 / logical.0).min(max.1 as f64 / logical.1);
+    let lower = (1..=8u32)
+        .map(|q| (fit * q as f64 + 1e-9).floor() / q as f64)
+        .fold(0.0, f64::max);
+    if lower < 1.0 {
+        return (size, scale);
+    }
+    let side = |logical: f64, max: u32| ((logical * lower) as u32).min(max);
+    let (w, h) = (side(logical.0, max.0), side(logical.1, max.1));
+    (hypr_ipc::clean_mode(w, h, lower as f32), lower)
 }
 
 /// GTK button number to evdev `BTN_*`.
@@ -1976,6 +2053,62 @@ mod tests {
         s.reset_resize();
         assert_ne!(s.resize_scale.get(), 1.25);
         assert_eq!(s.resize_requested.get(), (0, 0));
+    }
+
+    const MAC_MAX: (u32, u32) = (4096, 2304);
+
+    #[test]
+    fn a_window_that_fits_is_asked_for_as_it_is() {
+        // A 16-inch MacBook Pro and a 14-inch one in fullscreen.
+        for size in [(3456, 2234), (3024, 1964)] {
+            assert_eq!(headless_request(size, 2.0, MAC_MAX), (size, 2.0));
+        }
+        assert_eq!(
+            headless_request((1920, 1080), 1.0, (3840, 2160)),
+            ((1920, 1080), 1.0)
+        );
+    }
+
+    #[test]
+    fn a_larger_window_keeps_its_logical_size_at_a_lower_scale() {
+        // 5K at 2x, 2560x1440 logical.
+        assert_eq!(
+            headless_request((5120, 2880), 2.0, MAC_MAX),
+            ((4096, 2304), 1.6)
+        );
+        // A 24-inch iMac at 2x, 2240x1260 logical.
+        assert_eq!(
+            headless_request((4480, 2520), 2.0, MAC_MAX),
+            ((4032, 2268), 1.8)
+        );
+        // A 16:10 4K panel at 2x under the Linux limit, 1920x1200 logical.
+        assert_eq!(
+            headless_request((3840, 2400), 2.0, (3840, 2160)),
+            ((3456, 2160), 1.8)
+        );
+    }
+
+    #[test]
+    fn the_lower_scale_stays_clean_and_within_the_limit() {
+        // Pro Display XDR at 2x, 3008x1692 logical.
+        let ((w, h), scale) = headless_request((6016, 3384), 2.0, MAC_MAX);
+        assert!(w <= MAC_MAX.0 && h <= MAC_MAX.1);
+        assert_eq!((w, h), hypr_ipc::clean_mode(w, h, scale as f32));
+        assert!((w as f64 / scale - 3008.0).abs() <= 3.0);
+        assert!((h as f64 / scale - 1692.0).abs() <= 3.0);
+    }
+
+    #[test]
+    fn a_window_too_large_at_scale_one_is_left_to_the_server() {
+        assert_eq!(
+            headless_request((5120, 1440), 1.0, (3840, 2160)),
+            ((5120, 1440), 1.0)
+        );
+        // 2x gains nothing when even 1x does not fit.
+        assert_eq!(
+            headless_request((10240, 2880), 2.0, MAC_MAX),
+            ((10240, 2880), 2.0)
+        );
     }
 
     #[test]

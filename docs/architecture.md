@@ -57,7 +57,7 @@ video, cursor and pongs flow server→client.
 | `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, the pipeline that hands surfaces to `gliff-va` | yes, Vulkan API calls |
 | `gliff-sw` | CPU fallback with OpenH264 encode/decode, fused BGRA<->I420 conversion | the encoder trace level through the raw API, and the AVX2 row kernels (pointer loads and stores) |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
-| `gliff` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
+| `gliff` | GTK4/libadwaita UI, decode worker; also builds on macOS, CPU tier only | one block: hands GTK a dmabuf fd |
 | `gliff-probe` | environment checks and the headless test client | none |
 
 `gliff-vk` wraps `ash` and `gliff-va` wraps libva; both APIs are `unsafe`
@@ -212,6 +212,25 @@ Every crate with `unsafe` documents the safety requirements at each block.
   mirrored windows whose size is not an integer multiple of the stream.
   The picture and pointer mapping share the same layout. In fullscreen the
   header leaves the layout and slides in over the picture at the top edge.
+  A headless output is asked for at the window's size in device pixels and
+  its scale. When that exceeds the client's stream limit, as a 5K display
+  in fullscreen does, `headless_request` keeps the window's logical size at
+  the highest lower scale that fits (a fraction with a denominator up to 8,
+  as `clean_mode` aligns), never below 1, so the remote desktop keeps the
+  window's layout and gives up only pixel density.
+
+- **macOS client.** The client builds on macOS against Homebrew's GTK. The
+  GPU tier needs VA-API and Vulkan dmabuf import, so `gliff-vk`,
+  `hypr-capture` and `hypr-input` are Linux-only dependencies; on macOS
+  `no_gpu` stands in for the GPU decoder's types and the CPU tier decodes
+  everything. GDK reports macOS's native key codes, which `mac_keys` maps
+  by position to evdev (Command to Super, Option to Alt); Caps Lock arrives
+  as one event per tap and goes out as a press and a release. A Mac has no
+  XKB keymap to send, so the server types with its default layout. The Mac
+  client takes streams up to 4096x2304, the H.264 level 5.1 frame at 16:9
+  that servers already scale 5K to, so a headless screen in fullscreen
+  matches every MacBook panel at its default resolution. The protocol and
+  the server are unchanged.
 
 - **Theme.** `theme.rs` reads Omarchy 4's `colors.toml` with the same lenient
   line parser and fallback chain as `omarchy-theme-color`, and emits a `:root`
@@ -348,7 +367,14 @@ Not yet built, roughly in priority order:
    answered with a fresh keyframe rather than a retransmit. `LinkEstimator`,
    `RateController` and the ladder already take transport-neutral inputs
    (bytes sent, acks, a blocked marker) and carry over unchanged.
-4. **Polish**: multi-output selection UI, a `--max-fps` server flag, and a
+4. **macOS client: hardware decode and keyboard layout.** VideoToolbox
+   decodes H.264 on every Mac; two sessions with a Metal or CPU recombine
+   would bring Dual420 and its 4:4:4 colour, at a fraction of OpenH264's
+   CPU time. Remote typing in the Mac user's own layout needs an optional
+   `Hello` field carrying XKB layout names, which the `keymap` field's
+   documentation already reserves; the server would compile them with
+   `hypr_input::keymap_from_names`.
+5. **Polish**: multi-output selection UI, a `--max-fps` server flag, and a
    lazy file spool (a FUSE mount the pasting application
    reads through, so its own copy dialog shows progress, instead of
    spooling every file before the URI list is handed over).

@@ -1,6 +1,7 @@
 //! The local keymap to ship to the server, so every key maps the same on
 //! both ends. It follows the compositor: a change of keyboard or layout
-//! mid-session is sent on.
+//! mid-session is sent on. macOS has no XKB keymap to send, so there the
+//! server uses its default layout.
 
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ pub type Keymap = watch::Receiver<String>;
 /// server fall back to its default.
 pub const FIRST_KEYMAP_WAIT: Duration = Duration::from_secs(1);
 
+#[cfg(target_os = "linux")]
 pub fn watch() -> Keymap {
     let (tx, rx) = watch::channel(String::new());
     let sink = Box::new(move |text: String| {
@@ -24,4 +26,11 @@ pub fn watch() -> Keymap {
         tracing::warn!(error = %e, "cannot follow the local keymap; server will default to us");
     }
     rx
+}
+
+/// No keymap will come: the sender is already gone, so a session sends its
+/// Hello at once instead of waiting `FIRST_KEYMAP_WAIT` for one.
+#[cfg(not(target_os = "linux"))]
+pub fn watch() -> Keymap {
+    watch::channel(String::new()).1
 }

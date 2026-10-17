@@ -25,7 +25,8 @@ both ends, and falls back to the CPU on machines where it cannot.
 
 ## Requirements
 
-- Hyprland on both machines, with a session running on the remote one.
+- Hyprland on both machines, with a session running on the remote one. Your
+  machine can also be a Mac: see [Use from a Mac](#use-from-a-mac).
 - ssh access from your machine to the remote one.
 - For GPU video: an AMD or Intel GPU with its Vulkan and VA-API drivers
   (on Arch, `vulkan-radeon` and `mesa` for AMD, or `vulkan-intel` and
@@ -72,6 +73,8 @@ screen, or to get a private one:
 gliff --output DP-1 user@host   # mirror a named remote screen
 gliff --headless user@host      # a private remote screen, sized and
                                 # scaled to this window
+gliff --headless --fullscreen user@host
+                                # the same, fullscreen from the start
 ```
 
 A mirrored screen keeps its own size and is fitted into the window. A private
@@ -112,6 +115,40 @@ room. Two flags change the video, and you pass them to the server through
 ```
 gliff --server-bin 'gliff-server --low-bandwidth' user@host
 ```
+
+## Use from a Mac
+
+`gliff` also runs on macOS; the remote machine still runs Hyprland and
+`gliff-server`. Build it with Homebrew's GTK:
+
+```
+brew install gtk4 libadwaita adwaita-icon-theme pkgconf
+git clone https://github.com/omacom/gliff.git
+cd gliff
+cargo build --release --locked -p gliff
+```
+
+Then run `target/release/gliff`. For a remote screen that matches the Mac's:
+
+```
+target/release/gliff --headless --fullscreen user@host
+```
+
+In fullscreen the private screen takes the resolution and scale of the
+Mac's display (2x on a Retina display), so the remote desktop is laid out
+like the Mac's own and drawn pixel for pixel. Displays up to 4096x2304
+pixels, which covers every MacBook at its default resolution, stream at
+their own resolution. A larger one keeps its layout at a lower scale: a 5K
+display, 2560x1440 at 2x, gets a remote screen of 2560x1440 at 1.6x,
+stretched to fill it. Leave fullscreen and the remote screen follows the
+window again.
+
+On a Mac:
+
+- Video is decoded on the CPU, with 4:2:0 colour: macOS has no VA-API.
+- Keys are sent by position, Command as Super and Option as Alt. A Mac has
+  no XKB keymap to send, so the remote types with its default US layout.
+- macOS keeps Command-Tab, Command-Space and Mission Control for itself.
 
 ## If something does not work
 

@@ -1,6 +1,7 @@
 //! The client's network and decode worker: connect (TCP or ssh), run the
 //! protocol, decode the streams on the GPU, and hand finished display frames
-//! (dmabufs) to the GTK thread. Input commands flow the other way.
+//! (dmabufs) to the GTK thread. Input commands flow the other way. Off Linux
+//! there is no GPU tier, and the streams are always decoded on the CPU.
 //!
 //! The Vulkan objects live entirely on this worker thread; only dmabuf fds
 //! and plain values cross to the GTK thread.
@@ -20,18 +21,32 @@ use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
-use gliff_vk::{Decoder, DisplayFrame, Gpu};
+#[cfg(target_os = "linux")]
+pub use gliff_vk::DisplayFrame;
+#[cfg(target_os = "linux")]
+use gliff_vk::{Decoder, Gpu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
 
 use crate::clipboard::{Bridge, ToWorker};
 use crate::keymap::{Keymap, FIRST_KEYMAP_WAIT};
+#[cfg(not(target_os = "linux"))]
+pub use crate::no_gpu::DisplayFrame;
+#[cfg(not(target_os = "linux"))]
+use crate::no_gpu::{Decoder, Gpu};
 
 /// Stream geometry one picture was configured under: stream size, view
 /// size, and the effective scale x1000.
 type Geometry = ((u32, u32), (u32, u32), u32);
 
-const MAX_STREAM: (u32, u32) = (3840, 2160);
+/// The largest stream the client asks for. On macOS it is the whole H.264
+/// level 5.1 frame at 16:9, the size servers already scale a 5K screen to,
+/// so every built-in Retina panel up to the 16-inch MacBook Pro's 3456x2234
+/// streams at its own resolution.
+#[cfg(not(target_os = "macos"))]
+pub const MAX_STREAM: (u32, u32) = (3840, 2160);
+#[cfg(target_os = "macos")]
+pub const MAX_STREAM: (u32, u32) = (4096, 2304);
 // Older protocol-v1 GPU servers ignore the advertised limits on their first
 // stream. Accept their bounded encoder maximum so they can reach the resize.
 const MAX_DECODE: (u32, u32) = (4096, 4096);
@@ -201,6 +216,7 @@ enum VideoDecoder {
 /// Open the GPU for decoding, or `None` for the CPU tier. In `Gpu` mode a
 /// machine without Vulkan compute or a VA-API H.264 decoder falls back to
 /// the CPU.
+#[cfg(target_os = "linux")]
 fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
     if mode == VideoMode::Cpu {
         tracing::info!("using the CPU video pipeline as requested");
@@ -217,6 +233,15 @@ fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
             None
         }
     }
+}
+
+/// The GPU tier needs VA-API and Vulkan dmabuf import, which only Linux has.
+#[cfg(not(target_os = "linux"))]
+fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
+    if mode == VideoMode::Gpu {
+        tracing::info!("no GPU video pipeline on this platform; using the CPU pipeline");
+    }
+    None
 }
 
 fn new_decoder(

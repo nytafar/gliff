@@ -45,6 +45,21 @@ packet delays and compare its decoded pixels with the reference:
 gliff-probe --video cpu roundtrip --single --decode gpu --frame-delay-ms 300 --frames 20
 ```
 
+### macOS
+
+Only the client builds on macOS; the server needs Hyprland. With Homebrew:
+
+```
+brew install gtk4 libadwaita adwaita-icon-theme pkgconf
+cargo build --release --locked -p gliff
+```
+
+The GPU tier, capture and input crates are Linux-only dependencies of
+`gliff`, so on macOS the client decodes on the CPU tier whatever `--video`
+says. CI builds, lints and tests the client on macOS as well (the `macos`
+job). Code under `cfg(target_os = "macos")` compiles only there, except
+`mac_keys`, which is also compiled for tests so they run on Linux.
+
 ## Run on one machine
 
 Start a nested Hyprland, then inside it:
@@ -66,7 +81,8 @@ tiers independently, so every pairing can be tested on one machine.
 - **`scripts/check.sh`** runs what CI runs (`cargo fmt --check`, `cargo
   clippy --all-targets -- -D warnings`, `cargo test --workspace`); run it
   before every push, and `scripts/check.sh --fix` to apply the rustfmt and
-  clippy fixes first. Clippy lints gated on the MSRV (`rust-version` in
+  clippy fixes first. CI's `macos` job runs the same clippy and tests for
+  the client on macOS. Clippy lints gated on the MSRV (`rust-version` in
   `Cargo.toml`) switch on across the whole workspace when it is raised.
 - **Unit tests** cover the pure logic: AVC444 split/recombine losslessness,
   single-stream subsample/upsample, BGRA↔YUV444 colour round-trip, the H.264

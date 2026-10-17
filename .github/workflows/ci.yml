@@ -40,6 +40,16 @@ jobs:
       - uses: ./.github/actions/setup
       - run: mbx test --workspace --locked
 
+  # Only the client builds on macOS; the server needs Hyprland.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages
+        run: brew install gtk4 libadwaita pkgconf
+      - run: cargo clippy -p gliff --all-targets --locked -- -D warnings
+      - run: cargo test -p gliff --locked
+
   release:
     needs: [fmt, clippy, test]
     if: github.ref_type == 'tag'
