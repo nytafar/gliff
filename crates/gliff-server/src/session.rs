@@ -46,6 +46,8 @@ pub struct Config {
     pub capture: CaptureMode,
     /// Take over this physical screen with the headless output.
     pub takeover: Option<takeover::Settings>,
+    /// The frame-rate ceiling; ladder levels cap below it.
+    pub max_fps: u32,
 }
 
 /// Events from the capture thread.
@@ -133,7 +135,7 @@ where
         })
         .await?;
     let ladder = Ladder::new(START_LEVEL);
-    let start_fps = ladder.level().fps_cap.min(MAX_FPS);
+    let start_fps = ladder.level().fps_cap.min(cfg.max_fps);
     let fps_cmd = start_fps;
     let on_gpu = matches!(video, VideoTier::Gpu(_));
     let VideoStart {
@@ -263,6 +265,7 @@ where
         base_stream: stream,
         base_chroma: chroma,
         sent_fps_cap: start_fps,
+        max_fps: cfg.max_fps,
         cursor_shape_id: 0,
     };
 
@@ -528,11 +531,13 @@ struct Session {
     /// The fps cap in the last StreamConfig, so a pace-only level change
     /// still reaches the client.
     sent_fps_cap: u32,
+    /// The session-wide fps ceiling (`--max-fps`).
+    max_fps: u32,
     cursor_shape_id: u32,
 }
 
-/// The session-wide fps ceiling; ladder levels cap below it.
-const MAX_FPS: u32 = 60;
+/// The default session-wide fps ceiling; ladder levels cap below it.
+pub const MAX_FPS: u32 = 60;
 /// Still-picture refinement: at most this many re-encodes of an unchanged
 /// frame, at least this far apart.
 const MAX_REFINES: u8 = 8;
@@ -593,7 +598,7 @@ impl Session {
                     pixels,
                     dual,
                     can_drop_aux,
-                    MAX_FPS,
+                    self.max_fps,
                 ) {
                     tracing::info!(
                         level,
@@ -996,7 +1001,7 @@ impl Session {
 
     /// The ladder level's frame-rate ceiling, bounded by the session's.
     fn fps_cap(&self) -> u32 {
-        self.ladder.level().fps_cap.min(MAX_FPS)
+        self.ladder.level().fps_cap.min(self.max_fps)
     }
 
     /// A rung may only drop the auxiliary stream when the client can
@@ -1020,9 +1025,9 @@ impl Session {
     /// can sustain.
     fn update_fps_cmd(&mut self) {
         let sustainable = if self.encode_us > 0.0 {
-            (1e6 / (self.encode_us * 1.1)).clamp(5.0, MAX_FPS as f64) as u32
+            (1e6 / (self.encode_us * 1.1)).clamp(5.0, self.max_fps as f64) as u32
         } else {
-            MAX_FPS
+            self.max_fps
         };
         self.fps_cmd = self.fps_cap().min(sustainable).max(1);
     }
@@ -1064,7 +1069,7 @@ impl Session {
         }
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
         self.ctl
-            .reconfigure(want.0 as u64 * want.1 as u64, streams, MAX_FPS);
+            .reconfigure(want.0 as u64 * want.1 as u64, streams, self.max_fps);
         let settings = encoder_settings(
             want.0,
             want.1,
@@ -1157,7 +1162,7 @@ impl Session {
         self.ctl.reconfigure(
             self.stream.0 as u64 * self.stream.1 as u64,
             streams,
-            MAX_FPS,
+            self.max_fps,
         );
         self.settings = encoder_settings(
             self.stream.0,
@@ -1375,7 +1380,7 @@ impl VideoStart {
         let ctl = RateController::new(
             stream.0 as u64 * stream.1 as u64,
             streams,
-            MAX_FPS,
+            cfg.max_fps,
             cfg.bitrate,
         );
         let settings = encoder_settings(

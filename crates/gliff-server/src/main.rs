@@ -71,6 +71,9 @@ struct Cli {
     /// Single 4:2:0 stream instead of 4:4:4 (lower bandwidth).
     #[arg(long)]
     low_bandwidth: bool,
+    /// Frame-rate ceiling; the server adapts below it on a slow link.
+    #[arg(long, default_value_t = session::MAX_FPS, value_parser = clap::value_parser!(u32).range(1..=session::MAX_FPS as i64))]
+    max_fps: u32,
     /// Maximum bitrate in bits per second (default: derived from size). The
     /// server adapts below it when the link shows queueing.
     #[arg(long)]
@@ -132,6 +135,7 @@ fn main() -> Result<()> {
         video: gliff_sw::VideoMode::resolve(cli.video.as_deref()),
         full_chroma: cli.full_chroma,
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),
+        max_fps: cli.max_fps,
         takeover: cli.takeover.clone().map(|physical| takeover::Settings {
             physical,
             lock: cli.lock_cmd.clone(),

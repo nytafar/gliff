@@ -85,6 +85,15 @@ struct Cli {
     /// then takes this display's resolution and scale from the start.
     #[arg(long)]
     fullscreen: bool,
+    /// Scale of the private remote screen (`--headless`, `--takeover`),
+    /// instead of this display's. It keeps the remote layout and changes the
+    /// pixel count: `--scale 1` on a 2x Retina display streams half the
+    /// resolution each way, a quarter of the pixels, enlarged 2x here.
+    #[arg(long, value_parser = parse_scale)]
+    scale: Option<f64>,
+    /// Frame-rate ceiling for the remote server (at most 60).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=60))]
+    max_fps: Option<u32>,
     /// Hotkey that releases captured shortcuts and hands the keyboard back to
     /// the local compositor. Forms: a chord like `shift+escape`, `ctrl+alt+q`
     /// or `super+escape`; `double-<key>` for a double-tap (e.g.
@@ -283,6 +292,9 @@ fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
         (None, true) => vec!["--headless".into()],
         (None, false) => vec!["--output".into(), "auto".into()],
     };
+    if let Some(fps) = cli.max_fps {
+        t.server_args.extend(["--max-fps".into(), fps.to_string()]);
+    }
     Endpoint::Ssh(t)
 }
 
@@ -2018,6 +2030,9 @@ fn request_resize(ui: &App) {
     };
     let (mut size, mut scale) = (ui.view_size.get(), device_scale(ui));
     if s.headless.get() {
+        if let Some(remote) = ui.cli.scale {
+            (size, scale) = rescale(size, scale, remote);
+        }
         (size, scale) = headless_request(size, scale, net::MAX_STREAM);
     }
     if size.0 < 64
@@ -2064,6 +2079,19 @@ fn headless_request(size: (u32, u32), scale: f64, max: (u32, u32)) -> ((u32, u32
     (hypr_ipc::clean_mode(w, h, lower as f32), lower)
 }
 
+/// The same logical size at another scale.
+fn rescale(size: (u32, u32), scale: f64, to: f64) -> ((u32, u32), f64) {
+    let side = |v: u32| ((v as f64 / scale * to).round() as u32).max(2) & !1;
+    ((side(size.0), side(size.1)), to)
+}
+
+fn parse_scale(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if (0.5..=4.0).contains(&v) => Ok(v),
+        _ => Err("a scale from 0.5 to 4".into()),
+    }
+}
+
 /// GTK button number to evdev `BTN_*`.
 fn evdev_button(n: u32) -> u32 {
     match n {
@@ -2086,6 +2114,15 @@ fn device_scale(ui: &App) -> f64 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn a_lower_remote_scale_keeps_the_logical_size() {
+        assert_eq!(rescale((3024, 1964), 2.0, 1.0), ((1512, 982), 1.0));
+        assert_eq!(rescale((3456, 2234), 2.0, 1.5), ((2592, 1676), 1.5));
+        assert!(parse_scale("1").is_ok());
+        assert!(parse_scale("0").is_err());
+        assert!(parse_scale("x").is_err());
+    }
 
     #[test]
     fn reconnect_invalidates_the_previous_scale_request() {
