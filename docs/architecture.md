@@ -219,6 +219,31 @@ Every crate with `unsafe` documents the safety requirements at each block.
   as `clean_mode` aligns), never below 1, so the remote desktop keeps the
   window's layout and gives up only pixel density.
 
+- **Taking over a screen** (`gliff-server/src/takeover.rs`). `--takeover
+  DP-1` serves a headless output as `--headless` does and moves DP-1's
+  workspaces onto it, leaving DP-1 a `gliff-away` workspace with the away
+  panel (`gliff --away-panel`, a libadwaita window talking to the session
+  over a socket in `$XDG_RUNTIME_DIR/gliff`). While armed, DP-1 is
+  DPMS-off, `misc:key_press_enables_dpms` and `mouse_move_enables_dpms`
+  are off (the client's virtual input would otherwise wake it), and every
+  physical keyboard is disabled by device rule; a tick keeps DP-1 dark
+  against idle daemons and disables keyboards plugged in later, and a
+  `configreloaded` event re-arms. Hyprland treats virtual and physical
+  input alike, so the local mouse is recognised by its effect: the cursor
+  moving on the headless output with no client input in the last 500 ms
+  (client input can warp the cursor indirectly, as a workspace switch
+  does). The headless output sits 16384 layout pixels left of every screen,
+  because Hyprland re-places auto-positioned screens to the right of an
+  explicitly placed one, and the gap keeps the local mouse from crossing.
+  Hyprland 0.56's Lua config rejects `keyword` and the classic dispatcher
+  syntax, so `hypr-ipc` detects the flavour with `hl.dsp.no_op()` and
+  renders each command in either. Every change is written to a state file
+  before it is made; a guard child in its own process group restores it
+  when the server exits without doing so, and the session restores it
+  before the headless output is removed. A screen given back while still
+  dark stays dark and the session locks; a reclaim ends the session with
+  `ERROR_RECLAIMED`, in the fatal range, so the client does not reconnect.
+
 - **macOS client.** The client builds on macOS against Homebrew's GTK. The
   GPU tier needs VA-API and Vulkan dmabuf import, so `gliff-vk`,
   `hypr-capture` and `hypr-input` are Linux-only dependencies; on macOS

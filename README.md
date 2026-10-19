@@ -81,6 +81,24 @@ A mirrored screen keeps its own size and is fitted into the window. A private
 screen follows the window as you resize it, and is removed when you
 disconnect.
 
+**Away from the desk.** `--takeover` gives you a real screen's desktop at
+this window's resolution:
+
+```
+gliff --takeover DP-1 --fullscreen user@host
+```
+
+DP-1's workspaces move to a private screen sized to your window, and DP-1
+itself goes dark with the machine's keyboards switched off, so nobody at the
+desk can type into your session. Moving the desk's mouse wakes DP-1 and locks
+the session (your view locks too; unlock from either side). After an unlock,
+DP-1 shows a panel to take the screen back, which ends your session, or to
+turn it off again. When you disconnect, the workspaces go back to DP-1; if
+it was still dark, it stays dark and the session locks. If the server dies,
+a guard process puts everything back, and `gliff-server --reclaim` on the
+remote does the same by hand. `--lock-cmd` on the server changes the
+locker, which defaults to Omarchy's, else `loginctl lock-session`.
+
 Every machine you connect to gets a tab in the title bar. Click a tab to
 connect to that machine, or to switch to it: each connection keeps running
 while you look at another, so switching is instant. Hover a tab for its

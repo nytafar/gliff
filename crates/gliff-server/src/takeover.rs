@@ -40,9 +40,11 @@ pub const DEFAULT_LOCK: &str =
     "command -v omarchy-system-lock >/dev/null && omarchy-system-lock || loginctl lock-session";
 /// How often the armed state is checked against the compositor.
 const TICK: Duration = Duration::from_secs(2);
-/// Layout gap between the headless output and every other screen, so the
-/// local mouse cannot cross onto it.
-const LAYOUT_GAP: i32 = 4096;
+/// How far left of every screen the headless output's left edge sits. It
+/// goes left because Hyprland re-places auto-positioned screens to the right
+/// of an explicitly placed one; the gap stays wider than any headless output
+/// (4096 pixels at scale 0.5), so the local mouse cannot cross onto it.
+const LAYOUT_OFFSET: i32 = 16384;
 
 /// What is changed, kept on disk so it can be put back after a crash.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -58,6 +60,9 @@ pub struct State {
     /// Keyboards disabled while armed.
     pub disabled: Vec<String>,
     pub armed: bool,
+    /// Run when the screen is given back while still dark.
+    #[serde(default)]
+    pub lock: String,
 }
 
 /// Requests from the away panel, `--reclaim`, and the compositor.
@@ -91,16 +96,16 @@ pub struct Takeover {
     restored: bool,
 }
 
-/// Where the headless output goes: right of every screen, with a gap.
+/// Where the headless output goes: well left of every screen.
 pub fn headless_position(instance: &Instance) -> Result<(i32, i32)> {
-    let right = instance
+    let left = instance
         .monitors()?
         .iter()
         .filter(|m| !m.disabled)
-        .map(|m| m.x + m.logical_size().0)
-        .max()
+        .map(|m| m.x)
+        .min()
         .unwrap_or(0);
-    Ok((right + LAYOUT_GAP, 0))
+    Ok((left - LAYOUT_OFFSET, 0))
 }
 
 /// Check that the physical screen can be taken over, before anything is
@@ -165,6 +170,7 @@ impl Takeover {
             wake,
             disabled: Vec::new(),
             armed: false,
+            lock: settings.lock.clone(),
         };
         let mut takeover = Self {
             instance: instance.clone(),
@@ -417,8 +423,10 @@ fn restore_input(instance: &Instance, flavor: Flavor, state: &State) {
     }
 }
 
-/// Everything but removing the headless output: input back on, the screen
-/// lit, the workspaces back in place. Safe to run twice.
+/// Everything but removing the headless output: input back on and the
+/// workspaces back in place. A screen nobody has unlocked since it went dark
+/// stays dark and the session locks, so the desk wakes to the lock screen;
+/// one unlocked at the desk lights up. Safe to run twice.
 fn restore(instance: &Instance, flavor: Flavor, state: &State) {
     restore_input(instance, flavor, state);
     let run = |action: &Action| {
@@ -426,10 +434,12 @@ fn restore(instance: &Instance, flavor: Flavor, state: &State) {
             tracing::warn!(?action, error = %e, "compositor command failed");
         }
     };
-    run(&Action::Dpms {
-        monitor: &state.physical,
-        on: true,
-    });
+    if !state.armed {
+        run(&Action::Dpms {
+            monitor: &state.physical,
+            on: true,
+        });
+    }
     // Workspaces made during the session come back too, after the originals.
     let mut selectors = state.workspaces.clone();
     if let Ok(all) = instance.workspaces() {
@@ -452,6 +462,12 @@ fn restore(instance: &Instance, flavor: Flavor, state: &State) {
     run(&Action::FocusMonitor(&state.physical));
     if let Some(ws) = &state.active {
         run(&Action::FocusWorkspace(ws));
+    }
+    if state.armed && !state.lock.is_empty() {
+        run(&Action::Exec {
+            command: &state.lock,
+            workspace: None,
+        });
     }
 }
 
@@ -734,6 +750,7 @@ mod tests {
             wake: vec![("misc:key_press_enables_dpms".into(), true)],
             disabled: vec!["usb-keyboard".into()],
             armed: true,
+            lock: "loginctl lock-session".into(),
         };
         save(&path, &state).unwrap();
         assert_eq!(load(&path).unwrap(), state);
