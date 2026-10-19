@@ -7,6 +7,7 @@
 //! macOS frames arrive as pixels from the CPU tier, and key codes are
 //! translated by `mac_keys`.
 
+mod away;
 mod clipboard;
 mod clipboard_ui;
 mod keymap;
@@ -74,7 +75,13 @@ struct Cli {
     /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
     #[arg(long)]
     output: Option<String>,
-    /// Open the window fullscreen. With `--headless` the private screen
+    /// Take over the named remote output (e.g. `DP-1`) for when you are away
+    /// from it: its workspaces move to a private screen sized to this window,
+    /// and it goes dark with its keyboards off until its mouse moves, which
+    /// locks the remote session.
+    #[arg(long, conflicts_with_all = ["output", "headless"])]
+    takeover: Option<String>,
+    /// Open the window fullscreen. With `--headless` or `--takeover` the private screen
     /// then takes this display's resolution and scale from the start.
     #[arg(long)]
     fullscreen: bool,
@@ -226,6 +233,13 @@ fn main() -> glib::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    // Started by a `gliff-server --takeover` session on the screen it took.
+    let args: Vec<String> = std::env::args().collect();
+    if let [_, flag, socket, peer] = args.as_slice() {
+        if flag == "--away-panel" {
+            return away::run(socket, peer);
+        }
+    }
     let cli = Cli::parse();
     // GTK uses the program name as the Wayland app ID.
     glib::set_prgname(Some(APP_NAME));
@@ -259,6 +273,12 @@ fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
     let mut t = SshTarget::new(host.to_string());
     t.server_bin = cli.server_bin.clone();
     t.server_args = match (&cli.output, cli.headless) {
+        _ if cli.takeover.is_some() => {
+            vec![
+                "--takeover".into(),
+                cli.takeover.clone().unwrap_or_default(),
+            ]
+        }
         (Some(name), _) => vec!["--output".into(), name.clone()],
         (None, true) => vec!["--headless".into()],
         (None, false) => vec!["--output".into(), "auto".into()],

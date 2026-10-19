@@ -5,6 +5,10 @@
 
 #![forbid(unsafe_code)]
 
+mod actions;
+
+pub use actions::{lua_str, set_bool, set_device_enabled, Action, Flavor};
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -106,6 +110,14 @@ impl Instance {
         self.dir.join(".socket.sock")
     }
 
+    /// The event socket (`socket2`): one `name>>data` line per compositor
+    /// event, such as `configreloaded>>`, until the compositor exits.
+    pub fn events(&self) -> Result<impl Iterator<Item = std::io::Result<String>>> {
+        use std::io::BufRead;
+        let stream = UnixStream::connect(self.dir.join(".socket2.sock"))?;
+        Ok(std::io::BufReader::new(stream).lines())
+    }
+
     /// Wayland socket name (e.g. `wayland-1`) as recorded in `hyprland.lock`.
     pub fn wayland_display(&self) -> Result<String> {
         let lock = self.dir.join("hyprland.lock");
@@ -153,6 +165,29 @@ impl Instance {
         self.request_json("monitors all")
     }
 
+    pub fn workspaces(&self) -> Result<Vec<Workspace>> {
+        self.request_json("workspaces")
+    }
+
+    /// The keyboards Hyprland knows, virtual ones included.
+    pub fn keyboards(&self) -> Result<Vec<Keyboard>> {
+        Ok(self.request_json::<Devices>("devices")?.keyboards)
+    }
+
+    /// Which syntax the running config takes commands in: `hl.dsp.no_op()`
+    /// is a Lua dispatch, an unknown dispatcher to a hyprlang config.
+    pub fn flavor(&self) -> Result<Flavor> {
+        match self.dispatch("dispatch hl.dsp.no_op()") {
+            Ok(()) => Ok(Flavor::Lua),
+            Err(Error::Command { .. }) => Ok(Flavor::Hyprlang),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn run(&self, flavor: Flavor, action: &Action) -> Result<()> {
+        self.dispatch(&action.request(flavor))
+    }
+
     pub fn get_option(&self, name: &str) -> Result<OptionValue> {
         self.request_json(&format!("getoption {name}"))
     }
@@ -165,9 +200,10 @@ impl Instance {
         self.dispatch(&format!("output remove {name}"))
     }
 
-    /// Apply a monitor rule for `name`. A legacy (hyprlang) config takes the
-    /// `monitor` keyword; a Lua config rejects keywords and takes the same
-    /// rule through `eval hl.monitor`.
+    /// Apply a monitor rule for `name`, placed at `position` in the layout
+    /// or automatically. A legacy (hyprlang) config takes the `monitor`
+    /// keyword; a Lua config rejects keywords and takes the same rule through
+    /// `eval hl.monitor`.
     pub fn set_monitor_mode(
         &self,
         name: &str,
@@ -175,12 +211,14 @@ impl Instance {
         height: u32,
         hz: u32,
         scale: f32,
+        position: Option<(i32, i32)>,
     ) -> Result<()> {
-        let keyword = format!("keyword monitor {name},{width}x{height}@{hz},auto,{scale}");
+        let position = position.map_or_else(|| "auto".to_owned(), |(x, y)| format!("{x}x{y}"));
+        let keyword = format!("keyword monitor {name},{width}x{height}@{hz},{position},{scale}");
         match self.dispatch(&keyword) {
             Err(Error::Command { response, .. }) if response.contains("non-legacy") => {
                 self.dispatch(&format!(
-                    "eval hl.monitor({{ output = \"{name}\", mode = \"{width}x{height}@{hz}\", position = \"auto\", scale = {scale} }})"
+                    "eval hl.monitor({{ output = \"{name}\", mode = \"{width}x{height}@{hz}\", position = \"{position}\", scale = {scale} }})"
                 ))
             }
             other => other,
@@ -231,6 +269,84 @@ pub struct Monitor {
     pub focused: bool,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default = "yes")]
+    pub dpms_status: bool,
+    #[serde(default)]
+    pub active_workspace: Option<WorkspaceRef>,
+}
+
+impl Monitor {
+    /// The size in layout coordinates, which the scale and a quarter turn
+    /// change.
+    pub fn logical_size(&self) -> (i32, i32) {
+        let (w, h) = if self.transform & 1 != 0 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        let s = f64::from(self.scale.max(0.1));
+        (
+            (f64::from(w) / s).round() as i32,
+            (f64::from(h) / s).round() as i32,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceRef {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Workspace {
+    pub id: i64,
+    pub name: String,
+    pub monitor: String,
+    #[serde(default)]
+    pub windows: u32,
+}
+
+impl Workspace {
+    /// The dispatcher selector: the id for a numbered workspace, else the
+    /// name. Special workspaces have negative ids and belong to a monitor.
+    pub fn selector(&self) -> String {
+        selector(self.id, &self.name)
+    }
+}
+
+/// The dispatcher selector for a workspace id and name.
+pub fn selector(id: i64, name: &str) -> String {
+    if name == id.to_string() {
+        name.to_owned()
+    } else {
+        format!("name:{name}")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Devices {
+    #[serde(default)]
+    keyboards: Vec<Keyboard>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Keyboard {
+    pub name: String,
+    #[serde(default)]
+    pub main: bool,
+}
+
+impl Keyboard {
+    /// Created over the virtual-keyboard protocol (gliff's own input, IMEs,
+    /// dictation tools) rather than by a physical device.
+    pub fn is_virtual(&self) -> bool {
+        self.name.starts_with("hl-virtual-keyboard")
+    }
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn one() -> f32 {
@@ -288,6 +404,32 @@ mod tests {
         let explicit = Instance::discover_in(tmp.path(), Some("old_1_1")).unwrap();
         assert_eq!(explicit.signature, "old_1_1");
         assert!(Instance::discover_in(tmp.path(), Some("missing")).is_err());
+    }
+
+    #[test]
+    fn parses_monitors_workspaces_and_keyboards() {
+        let m: Vec<Monitor> = serde_json::from_str(
+            r#"[{"id":0,"name":"DP-1","width":3840,"height":2160,"scale":2.0,"x":0,"y":0,
+                "dpmsStatus":false,"activeWorkspace":{"id":14,"name":"14"}}]"#,
+        )
+        .unwrap();
+        assert!(!m[0].dpms_status);
+        assert_eq!(m[0].active_workspace.as_ref().unwrap().id, 14);
+        assert_eq!(m[0].logical_size(), (1920, 1080));
+        let w: Vec<Workspace> = serde_json::from_str(
+            r#"[{"id":3,"name":"3","monitor":"DP-1","windows":1},
+                {"id":7,"name":"mail","monitor":"DP-1","windows":0}]"#,
+        )
+        .unwrap();
+        assert_eq!(w[0].selector(), "3");
+        assert_eq!(w[1].selector(), "name:mail");
+        let d: Devices = serde_json::from_str(
+            r#"{"mice":[],"keyboards":[{"name":"usb-keyboard","main":false},
+                {"name":"hl-virtual-keyboard-unknown","main":true}]}"#,
+        )
+        .unwrap();
+        assert!(!d.keyboards[0].is_virtual());
+        assert!(d.keyboards[1].is_virtual());
     }
 
     #[test]

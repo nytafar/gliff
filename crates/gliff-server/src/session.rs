@@ -15,7 +15,7 @@ use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardMsg, Codec, Greeting,
     OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, VideoPipeline, ERROR_NO_CHROMA,
-    ERROR_NO_CODEC, ERROR_VERSION, PROTOCOL_VERSION,
+    ERROR_NO_CODEC, ERROR_RECLAIMED, ERROR_VERSION, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Jobs;
@@ -31,6 +31,7 @@ use hypr_wl::Target;
 
 use crate::clipboard::Bridge;
 use crate::notify;
+use crate::takeover::{self, Takeover};
 
 pub struct Config {
     pub target: Target,
@@ -43,6 +44,8 @@ pub struct Config {
     pub full_chroma: bool,
     /// What the capture ring is made of; `Shm` implies the CPU tier.
     pub capture: CaptureMode,
+    /// Take over this physical screen with the headless output.
+    pub takeover: Option<takeover::Settings>,
 }
 
 /// Events from the capture thread.
@@ -103,6 +106,13 @@ where
     let instance = cfg.target.instance().context("find Hyprland instance")?;
     let output = setup_output(&instance, &cfg, &caps)?;
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
+    let (mut takeover, mut takeover_rx) = match &cfg.takeover {
+        Some(settings) => {
+            let (t, rx) = Takeover::start(&instance, settings, &output.name, &instance.signature)?;
+            (Some(t), Some(rx))
+        }
+        None => (None, None),
+    };
 
     let video = VideoTier::open(cfg.video, cfg.capture, &cfg.render_node);
     let codec = Codec::H264;
@@ -184,6 +194,9 @@ where
                 y: height as f64 / 2.0,
             })
             .ok();
+        if let Some(t) = takeover.as_mut() {
+            t.note_input();
+        }
     }
 
     let (clip_ev_tx, mut clip_ev_rx) = mpsc::unbounded_channel::<ClipboardEvent>();
@@ -215,6 +228,7 @@ where
         tokio::time::Instant::from_std(Instant::now() + FIRST_FRAME_DEADLINE);
     let mut clip_open = true;
     let mut session = Session {
+        takeover,
         writer,
         video,
         instance,
@@ -281,6 +295,31 @@ where
                 ControlFlow::Continue(())
             }
             ev = cap_rx.recv() => session.on_capture(ev)?,
+            ev = recv_some(&mut takeover_rx) => match ev {
+                Some(takeover::Event::Reclaim) => {
+                    tracing::info!("the screen was reclaimed at the desk");
+                    session
+                        .writer
+                        .finish(
+                            ServerMsg::error(ERROR_RECLAIMED, "The screen was taken back at the desk"),
+                            Duration::from_secs(1),
+                        )
+                        .await;
+                    ControlFlow::Break(())
+                }
+                Some(ev) => {
+                    if let Some(t) = session.takeover.as_mut() {
+                        if let Err(e) = t.on_event(ev) {
+                            tracing::warn!(error = %e, "takeover");
+                        }
+                    }
+                    ControlFlow::Continue(())
+                }
+                None => {
+                    takeover_rx = None;
+                    ControlFlow::Continue(())
+                }
+            },
             report = write_reports.recv() => {
                 let elapsed = report.context("writer task ended")??;
                 // A write that took longer than a frame interval means the
@@ -327,16 +366,26 @@ where
     let Session {
         capturer,
         input,
+        takeover,
         output,
         ..
     } = session;
     // Hyprland 0.56 aborts if a cursor capture session is still alive when
     // its monitor is removed, so end the capture and input threads before
-    // dropping the output.
+    // dropping the output. A takeover gives the workspaces back first.
     drop(capturer);
     drop(input);
+    drop(takeover);
     drop(output);
     Ok(())
+}
+
+/// The next item of an optional channel; never ready without one.
+async fn recv_some<T>(rx: &mut Option<UnboundedReceiver<T>>) -> Option<T> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Read the client's Hello and check its protocol version.
@@ -413,6 +462,9 @@ where
 }
 
 struct Session {
+    /// Declared first so that, on an error exit, it gives the workspaces
+    /// back before the headless output is removed.
+    takeover: Option<Takeover>,
     writer: Writer,
     video: VideoTier,
     instance: hypr_ipc::Instance,
@@ -494,6 +546,17 @@ const START_LEVEL: usize = 1;
 
 impl Session {
     async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
+        if let Some(t) = self.takeover.as_mut() {
+            if matches!(
+                msg,
+                ClientMsg::Key { .. }
+                    | ClientMsg::PointerMotion { .. }
+                    | ClientMsg::PointerButton { .. }
+                    | ClientMsg::PointerAxis { .. }
+            ) {
+                t.note_input();
+            }
+        }
         match msg {
             ClientMsg::Bye => return Ok(ControlFlow::Break(())),
             ClientMsg::FrameAck { frame_id, .. } => {
@@ -644,10 +707,14 @@ impl Session {
             return Ok(());
         }
         tracing::info!(width, height, scale, "resizing headless output");
-        if let Err(e) = self
-            .instance
-            .set_monitor_mode(&self.output.name, width, height, 60, scale)
-        {
+        if let Err(e) = self.instance.set_monitor_mode(
+            &self.output.name,
+            width,
+            height,
+            60,
+            scale,
+            self.output.position,
+        ) {
             tracing::warn!(error = %e, "could not resize the headless output");
             return Ok(());
         }
@@ -675,7 +742,7 @@ impl Session {
                 self.output.height = old_h;
                 let s = self.output.scale;
                 self.instance
-                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
+                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s, self.output.position)
                     .ok();
                 self.wait_for_mode(old_w, old_h, s).await;
                 self.inject(self.output.logical_extent());
@@ -793,6 +860,9 @@ impl Session {
                 self.writer.send(msg, vec![argb]);
             }
             Some(Incoming::CursorPos { x, y, visible }) => {
+                if let Some(t) = self.takeover.as_mut() {
+                    t.on_cursor(x, y);
+                }
                 self.writer.send(
                     ServerMsg::CursorPos {
                         x,
@@ -1457,6 +1527,9 @@ struct SessionOutput {
     /// Output scale; the logical size the pointer works in is size / scale.
     scale: f32,
     headless: Option<hypr_ipc::Instance>,
+    /// Where a headless output sits in the layout; `None` lets Hyprland
+    /// place it.
+    position: Option<(i32, i32)>,
 }
 
 impl SessionOutput {
@@ -1554,8 +1627,18 @@ fn setup_output(
             } & !1,
             scale: m.scale,
             headless: None,
+            position: None,
         });
     }
+    // A taken-over screen's workspaces move to the headless output, which
+    // sits apart from every screen so the local mouse cannot reach it.
+    let position = match &cfg.takeover {
+        Some(t) => {
+            takeover::check(instance, &t.physical)?;
+            Some(takeover::headless_position(instance)?)
+        }
+        None => None,
+    };
     let before: Vec<String> = instance.monitors()?.into_iter().map(|m| m.name).collect();
     let requested = format!("gliff-{}", std::process::id());
     instance
@@ -1568,6 +1651,7 @@ fn setup_output(
         height: 0,
         scale: 1.0,
         headless: Some(instance.clone()),
+        position,
     };
     std::thread::sleep(Duration::from_millis(200));
     let after = instance.monitors()?;
@@ -1578,7 +1662,7 @@ fn setup_output(
     output.name = m.name.clone();
     let width = caps.max_width.clamp(320, 1920) & !1;
     let height = caps.max_height.clamp(240, 1080) & !1;
-    if let Err(e) = instance.set_monitor_mode(&output.name, width, height, 60, 1.0) {
+    if let Err(e) = instance.set_monitor_mode(&output.name, width, height, 60, 1.0, position) {
         tracing::warn!(error = %e, "could not set the headless output mode");
     }
     // Hyprland applies the mode asynchronously; stream whatever it settled

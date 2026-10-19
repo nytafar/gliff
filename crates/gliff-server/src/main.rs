@@ -8,6 +8,7 @@ mod clipboard;
 mod notify;
 mod rate;
 mod session;
+mod takeover;
 mod writer;
 
 use std::path::PathBuf;
@@ -43,6 +44,24 @@ struct Cli {
     /// window instead of mirroring.
     #[arg(long)]
     headless: bool,
+    /// Take over a physical output such as `DP-1`: its workspaces move to a
+    /// headless output at the client's resolution, and it goes dark with
+    /// the local keyboards off until the local mouse moves, which locks the
+    /// session.
+    #[arg(long, conflicts_with_all = ["output", "headless"])]
+    takeover: Option<String>,
+    /// Shell command that locks the session when the local mouse wakes a
+    /// taken-over screen.
+    #[arg(long, default_value = takeover::DEFAULT_LOCK)]
+    lock_cmd: String,
+    /// Give a taken-over screen back: end the session using it, or restore
+    /// what a crashed one left behind. Takes the output name, or all.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    reclaim: Option<String>,
+    /// Internal: restore a takeover once the server holding the other end of
+    /// stdin exits.
+    #[arg(long, hide = true)]
+    takeover_guard: Option<PathBuf>,
     /// Hyprland instance signature (default: newest).
     #[arg(long)]
     instance: Option<String>,
@@ -83,6 +102,14 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    if let Some(output) = &cli.reclaim {
+        let instance = hypr_ipc::Instance::discover(cli.instance.as_deref())?;
+        return takeover::reclaim(&instance, Some(output.as_str()).filter(|o| !o.is_empty()));
+    }
+    if let Some(state) = &cli.takeover_guard {
+        let instance = hypr_ipc::Instance::discover(cli.instance.as_deref())?;
+        return takeover::guard(&instance, state);
+    }
     if cli.stdio {
         assert_stdout_is_free()?;
     }
@@ -94,7 +121,7 @@ fn main() -> Result<()> {
     let render_node = hypr_capture::render_node_for_target(cli.render_node.as_deref(), &target);
     let cfg = session::Config {
         target,
-        output: if cli.headless {
+        output: if cli.headless || cli.takeover.is_some() {
             None
         } else {
             Some(cli.output.clone().unwrap_or_else(|| "auto".into()))
@@ -105,6 +132,11 @@ fn main() -> Result<()> {
         video: gliff_sw::VideoMode::resolve(cli.video.as_deref()),
         full_chroma: cli.full_chroma,
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),
+        takeover: cli.takeover.clone().map(|physical| takeover::Settings {
+            physical,
+            lock: cli.lock_cmd.clone(),
+            peer: takeover::peer_name(),
+        }),
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

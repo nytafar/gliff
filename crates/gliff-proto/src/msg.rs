@@ -46,6 +46,9 @@ pub fn features() -> Vec<String> {
 pub const ERROR_VERSION: u16 = 1;
 pub const ERROR_NO_CHROMA: u16 = 2;
 pub const ERROR_NO_CODEC: u16 = 3;
+/// The server's screen was taken back at the machine itself. Retrying would
+/// take it over again, so the client stops, as for the codes above.
+pub const ERROR_RECLAIMED: u16 = 4;
 
 pub fn is_incompatible(code: u16) -> bool {
     (1..256).contains(&code)

@@ -1,7 +1,7 @@
 //! A dedicated task for the socket write half, so the session loop never
 //! waits on the network and keeps handling input while a write is blocked.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -65,6 +65,8 @@ impl Queue {
             | ServerMsg::ClipboardData { .. }
             | ServerMsg::ClipboardAck { .. }
             | ServerMsg::ClipboardAbort { .. } => {}
+            // The last message of a session, sent by `Writer::finish`.
+            ServerMsg::Error { .. } => {}
             _ => unreachable!("unsupported queued server message"),
         }
         self.packets.push_back((msg, payloads));
@@ -77,6 +79,8 @@ impl Queue {
 pub struct Writer {
     queue: Rc<RefCell<Queue>>,
     notify: Rc<Notify>,
+    /// A popped message is being written.
+    busy: Rc<Cell<bool>>,
     task: JoinHandle<()>,
 }
 
@@ -86,10 +90,12 @@ impl Writer {
     ) -> (Self, mpsc::Receiver<Result<Duration>>) {
         let queue = Rc::new(RefCell::new(Queue::default()));
         let notify = Rc::new(Notify::new());
+        let busy = Rc::new(Cell::new(false));
         let (report_tx, report_rx) = mpsc::channel(1);
         let task = {
             let queue = queue.clone();
             let notify = notify.clone();
+            let busy = busy.clone();
             tokio::task::spawn_local(async move {
                 loop {
                     let packet = queue.borrow_mut().packets.pop_front();
@@ -97,10 +103,12 @@ impl Writer {
                         notify.notified().await;
                         continue;
                     };
+                    busy.set(true);
                     let parts: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
                     let begin = Instant::now();
                     let result = framed.write_msg_with_payloads(&msg, &parts).await;
                     let elapsed = begin.elapsed();
+                    busy.set(false);
                     tracing::debug!(
                         write_ms = elapsed.as_secs_f64() * 1000.0,
                         "output write completed"
@@ -117,6 +125,7 @@ impl Writer {
             Self {
                 queue,
                 notify,
+                busy,
                 task,
             },
             report_rx,
@@ -127,6 +136,24 @@ impl Writer {
     pub fn send(&self, msg: ServerMsg, payloads: Vec<Vec<u8>>) {
         self.queue.borrow_mut().push(msg, payloads);
         self.notify.notify_one();
+    }
+
+    /// End the session with `msg`: drop whatever is still queued, send it,
+    /// and wait up to `timeout` for it to be written.
+    pub async fn finish(&self, msg: ServerMsg, timeout: Duration) {
+        {
+            let mut queue = self.queue.borrow_mut();
+            queue.packets.clear();
+            queue.push(msg, Vec::new());
+        }
+        self.notify.notify_one();
+        let deadline = Instant::now() + timeout;
+        while (!self.queue.borrow().packets.is_empty() || self.busy.get())
+            && !self.task.is_finished()
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// True when no video frame is waiting to be written.
